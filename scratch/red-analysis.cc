@@ -37,7 +37,7 @@ int main(int argc, char *argv[])
   
   // Create the bottleneck link
   PointToPointHelper bottleneck;
-  bottleneck.SetDeviceAttribute("DataRate", StringValue("1Mbps"));
+  bottleneck.SetDeviceAttribute("DataRate", StringValue("500kbps"));
   bottleneck.SetChannelAttribute("Delay", StringValue("20ms"));
   
   // Create the edge links
@@ -91,7 +91,7 @@ int main(int argc, char *argv[])
   // Create a TCP traffic source
   OnOffHelper source("ns3::TcpSocketFactory", 
                      InetSocketAddress(i23.GetAddress(1), port));
-  source.SetAttribute("DataRate", StringValue("5Mbps")); // Higher than bottleneck to create congestion
+  source.SetAttribute("DataRate", StringValue("20Mbps")); // Higher than bottleneck to create congestion
   source.SetAttribute("PacketSize", UintegerValue(512));
   source.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
   source.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
