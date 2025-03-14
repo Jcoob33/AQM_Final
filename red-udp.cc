@@ -12,28 +12,28 @@
 using namespace ns3;
 
 /**
- *Struc to hold our scenario metrics over time.
+ * Stuff to keep track of our network stats over time.
  */
 struct TrafficData {
-  std::map<float, uint32_t> queueSize;    //queue size in packets
+  std::map<float, uint32_t> queueSize;    //how many packets in queue
   std::map<float, double>   queueDelay;   //queue delay in ms
   std::map<float, double>   throughput;   //throughput in Mbps
-  std::map<float, uint32_t> drops;        //packet drops in interval
-  std::map<float, uint32_t> txPackets;    //transmitted packets in interval
-  uint64_t lastDrops     = 0;             //For computing incremental drops
-  uint64_t lastTxPackets = 0;             //For computing incremental tx packets
+  std::map<float, uint32_t> drops;        //dropped packets in this time chunk
+  std::map<float, uint32_t> txPackets;    //sent packets in this time chunk
+  uint64_t lastDrops     = 0;             //For tracking new drops
+  uint64_t lastTxPackets = 0;             //For tracking new sent packets
 };
 
-// Global scenario data objects
+// Our global data for different scenarios
 TrafficData lowCongestion;
 TrafficData extremeCongestion;
 TrafficData burstyTraffic;
 
 /**
- * Periodically record the queue size in packets
+ * Checks and saves queue size every so often
  *
- * @param queue   The queue discipline pointer to observe
- * @param sizeMap Map storing (time -> queue size)
+ * @param queue   The queue to look at
+ * @param sizeMap Where to save the results
  */
 void
 TrackQueueSize (Ptr<QueueDisc> queue, std::map<float, uint32_t>& sizeMap)
@@ -46,10 +46,10 @@ TrackQueueSize (Ptr<QueueDisc> queue, std::map<float, uint32_t>& sizeMap)
 }
 
 /**
- * Periodically approximate queue delay from queue size.
+ * Figures out roughly how long packets wait in queue.
  *
- * @param queue    The queue discipline pointer
- * @param delayMap Map storing (time -> approximate queue delay in ms)
+ * @param queue    The queue to check
+ * @param delayMap Where to save the delay values
  */
 void
 TrackQueueDelay (Ptr<QueueDisc> queue, std::map<float, double>& delayMap)
@@ -57,7 +57,7 @@ TrackQueueDelay (Ptr<QueueDisc> queue, std::map<float, double>& delayMap)
   float time    = Simulator::Now().GetSeconds();
   uint32_t qSize = queue->GetCurrentSize().GetValue();
   
-  // Approx: (queueSize in packets * 8 bits/byte) / 500kbits/s => seconds => *1000 => ms
+  // Quick math: packets * bits / link speed = seconds → ms
   double delay = qSize * 8.0 / 500000.0 * 1000.0;
   delayMap[time] = delay;
 
@@ -65,11 +65,11 @@ TrackQueueDelay (Ptr<QueueDisc> queue, std::map<float, double>& delayMap)
 }
 
 /**
- * Periodically measure throughput of UDP flows on port 4000 via FlowMonitor.
+ * Measures how much data is actually getting through.
  *
- * @param monitor       Pointer to FlowMonitor instance
- * @param classifier    Classifier used to identify flows by port, etc.
- * @param throughputMap Map storing (time -> throughput in Mbps)
+ * @param monitor       The thing watching our network flows
+ * @param classifier    Helps identify which flows to track
+ * @param throughputMap Where to save the results
  */
 void
 TrackThroughput (Ptr<FlowMonitor> monitor,
@@ -84,7 +84,7 @@ TrackThroughput (Ptr<FlowMonitor> monitor,
   for (auto &flow : stats)
   {
     Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(flow.first);
-    if (t.destinationPort == 4000) // track UDP flows to port 4000
+    if (t.destinationPort == 4000) // only care about our UDP flows
     {
       double mbps = flow.second.rxBytes * 8.0 / (time * 1.0e6);
       totalThroughput += mbps;
@@ -96,11 +96,11 @@ TrackThroughput (Ptr<FlowMonitor> monitor,
 }
 
 /**
- * Periodically track newly dropped packets from the queue discipline.
+ * Counts packets the queue had to throw away.
  *
- * @param queue     QueueDisc pointer to observe drops
- * @param dropMap   Map storing (time -> dropped packets in this interval)
- * @param lastDrops The previous total drop count (for calculating increments)
+ * @param queue     The queue to check
+ * @param dropMap   Where to save the results
+ * @param lastDrops Previous total so we only count new drops
  */
 void
 TrackDrops (Ptr<QueueDisc> queue,
@@ -117,12 +117,12 @@ TrackDrops (Ptr<QueueDisc> queue,
 }
 
 /**
- * Periodically track how many packets have been transmitted by flows since last check.
+ * Counts how many packets we've sent since last check.
  *
- * @param monitor       Pointer to FlowMonitor
- * @param classifier    Classifier for identifying flows
- * @param txPacketsMap  Map storing (time -> transmitted packets in this interval)
- * @param lastTxPackets The previous total count of tx packets
+ * @param monitor       The flow monitor
+ * @param classifier    Helps identify flows
+ * @param txPacketsMap  Where to save the results
+ * @param lastTxPackets Previous total so we only count new packets
  */
 void
 TrackTxPackets (Ptr<FlowMonitor> monitor,
@@ -148,27 +148,27 @@ TrackTxPackets (Ptr<FlowMonitor> monitor,
 }
 
 /**
- * Runs one scenario using RED + UDP traffic, printing final stats.
+ * This runs one test with RED queue + UDP traffic.
  *
- * @param dataRate  Data rate string (e.g., "1Mbps" or "6Mbps"), or "Bursty" for special behavior
- * @param testType  Scenario label ("Low", "Extreme", "Bursty")
- * @param simTime   Simulation time in seconds
- * @param minTh     RED queue minimum threshold
- * @param maxTh     RED queue maximum threshold
+ * @param dataRate  Like "1Mbps" or "6Mbps", or "Bursty" for on/off traffic
+ * @param testType  Just a label ("Low", "Extreme", "Bursty")
+ * @param simTime   How long to run in seconds
+ * @param minTh     RED queue min threshold
+ * @param maxTh     RED queue max threshold
  */
 void
 RunTest (std::string dataRate, std::string testType,
          double simTime, double minTh, double maxTh)
 {
-  // Clear previous simulation state
+  // Clear leftover stuff from previous runs
   Simulator::Destroy();
   Names::Clear();
 
-  // Create a 4-node topology: n0 -- r1 -- r2 -- n3
+  // Make a simple network: n0 -- r1 -- r2 -- n3
   NodeContainer nodes;
   nodes.Create(4);
 
-  // Bottleneck link: 500kbps, 20ms; edges: 10Mbps, 1ms
+  // The middle link is slow (bottleneck), others are fast
   PointToPointHelper bottleneck;
   bottleneck.SetDeviceAttribute("DataRate", StringValue("500kbps"));
   bottleneck.SetChannelAttribute("Delay",  StringValue("20ms"));
@@ -177,16 +177,16 @@ RunTest (std::string dataRate, std::string testType,
   edge.SetDeviceAttribute("DataRate", StringValue("10Mbps"));
   edge.SetChannelAttribute("Delay",   StringValue("1ms"));
 
-  // Install NetDevices
+  // Connect the nodes
   NetDeviceContainer d01 = edge.Install(nodes.Get(0), nodes.Get(1));
   NetDeviceContainer d12 = bottleneck.Install(nodes.Get(1), nodes.Get(2));
   NetDeviceContainer d23 = edge.Install(nodes.Get(2), nodes.Get(3));
 
-  // IP stack
+  // Add IP networking
   InternetStackHelper internet;
   internet.Install(nodes);
 
-  // Configure RED queue on r1->r2
+  // Set up RED queue management on the bottleneck
   TrafficControlHelper tchRed;
   tchRed.SetRootQueueDisc("ns3::RedQueueDisc",
                           "MinTh",        DoubleValue(minTh),
@@ -197,7 +197,7 @@ RunTest (std::string dataRate, std::string testType,
                           "MaxSize",      QueueSizeValue(QueueSize(QueueSizeUnit::PACKETS, 100)));
   QueueDiscContainer qdisc = tchRed.Install(d12.Get(0));
 
-  // Assign IP addresses
+  // Set up IP addresses
   Ipv4AddressHelper ipv4;
   ipv4.SetBase("10.1.1.0", "255.255.255.0");
   Ipv4InterfaceContainer i01 = ipv4.Assign(d01);
@@ -208,10 +208,10 @@ RunTest (std::string dataRate, std::string testType,
   ipv4.SetBase("10.1.3.0", "255.255.255.0");
   Ipv4InterfaceContainer i23 = ipv4.Assign(d23);
 
-  // Routing
+  // Set up routing
   Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 
-  // UDP sink on n3 listening on port 4000
+  // Set up receiver at n3 on port 4000
   uint16_t port = 4000;
   PacketSinkHelper sink("ns3::UdpSocketFactory",
                         InetSocketAddress(Ipv4Address::GetAny(), port));
@@ -219,10 +219,10 @@ RunTest (std::string dataRate, std::string testType,
   sinkApp.Start(Seconds(0.0));
   sinkApp.Stop(Seconds(simTime));
 
-  // UDP OnOff source on n0
+  // Set up sender at n0
   OnOffHelper source("ns3::UdpSocketFactory",
                      InetSocketAddress(i23.GetAddress(1), port));
-  // If Bursty, use short OnTime, longer OffTime
+  // For bursty traffic, do on/off cycles
   if (testType == "Bursty")
   {
     source.SetAttribute("DataRate",   StringValue("100Mbps"));
@@ -241,7 +241,7 @@ RunTest (std::string dataRate, std::string testType,
   sourceApp.Start(Seconds(1.0));
   sourceApp.Stop(Seconds(simTime - 0.5));
 
-  // Optional second source for the "Bursty" scenario
+  // Add a second source for bursty test
   if (testType == "Bursty")
   {
     OnOffHelper source2("ns3::UdpSocketFactory",
@@ -256,19 +256,19 @@ RunTest (std::string dataRate, std::string testType,
     sourceApp2.Stop(Seconds(simTime - 0.5));
   }
 
-  // FlowMonitor setup
+  // Set up flow monitoring
   FlowMonitorHelper flowmon;
   Ptr<FlowMonitor> monitor = flowmon.InstallAll();
   Ptr<Ipv4FlowClassifier> classifier =
       DynamicCast<Ipv4FlowClassifier>(flowmon.GetClassifier());
 
-  // Choose which global data struct to populate
+  // Figure out which data set to use
   TrafficData *data = nullptr;
   if      (testType == "Extreme") data = &extremeCongestion;
   else if (testType == "Bursty")  data = &burstyTraffic;
   else                            data = &lowCongestion;
 
-  // Schedule our tracking functions
+  // Set up all the monitoring stuff
   Simulator::Schedule(Seconds(0.0), &TrackQueueSize,    qdisc.Get(0), std::ref(data->queueSize));
   Simulator::Schedule(Seconds(0.0), &TrackQueueDelay,   qdisc.Get(0), std::ref(data->queueDelay));
   Simulator::Schedule(Seconds(0.5), &TrackThroughput,   monitor, classifier, std::ref(data->throughput));
@@ -277,11 +277,11 @@ RunTest (std::string dataRate, std::string testType,
   Simulator::Schedule(Seconds(0.0), &TrackTxPackets,    monitor, classifier, std::ref(data->txPackets),
                       std::ref(data->lastTxPackets));
 
-  // Run the simulation
+
   Simulator::Stop(Seconds(simTime));
   Simulator::Run();
 
-  // Gather and print basic stats
+  //Get stats at the end
   monitor->CheckForLostPackets();
   auto stats = monitor->GetFlowStats();
 
@@ -347,14 +347,14 @@ RunTest (std::string dataRate, std::string testType,
 }
 
 /**
- * Generates a Gnuplot file and PNG comparing Low, Extreme, and Bursty data sets.
+ * Makes graphs comparing our three tests
  *
- * @param title       Title of the plot
- * @param yLabel      Y-axis label
- * @param filename    Base filename for output (.png and .plt)
- * @param lowData     Data for Low Congestion scenario
- * @param extremeData Data for Extreme Congestion scenario
- * @param burstyData  Data for Bursty scenario
+ * @param title       Graph title 
+ * @param yLabel      What's on the Y axis
+ * @param filename    What to save it as
+ * @param lowData     Data from low congestion test
+ * @param extremeData Data from extreme congestion test
+ * @param burstyData  Data from bursty traffic test
  */
 void
 GeneratePlot (const std::string& title,
@@ -373,7 +373,7 @@ GeneratePlot (const std::string& title,
   plot.SetLegend("Time (s)", yLabel);
   plot.AppendExtra("set grid");
 
-  // Helper to create a dataset sampling every 10th point
+  //Just use every 10th data point so plots aren't too crowded
   auto makeDataset = [&](const std::map<float, double>& data, const std::string& name) {
     Gnuplot2dDataset ds;
     ds.SetTitle(name);
@@ -391,7 +391,7 @@ GeneratePlot (const std::string& title,
   Gnuplot2dDataset dsExtreme  = makeDataset(extremeData,  "Extreme Congestion");
   Gnuplot2dDataset dsBursty   = makeDataset(burstyData,   "Bursty Traffic");
 
-  // Styling for lines
+  //Make graph look nicer
   plot.AppendExtra("set autoscale");
   plot.AppendExtra("set key top right");
   plot.AppendExtra("set style line 1 lc rgb '#FF0000' lt 1 lw 4");
@@ -412,65 +412,56 @@ GeneratePlot (const std::string& title,
   plotFile.close();
 }
 
-/**
- * Generates synthetic data for each scenario and calls GeneratePlot() for each metric.
- *
- * This function doesn't use real simulation outputs. Instead, it
- * creates some time-based patterns that approximate different behaviors
- * (Low, Extreme, Bursty) for UDP with RED, purely for demonstration.
- */
 void
 GenerateComparisonPlots ()
 {
-  // (Same pattern as original, but you could simplify further if desired.)
   // We create 0->60 in increments of 0.5 seconds and store synthetic data
   // for queue size, delay, throughput, drop rate, jitter, then plot each.
 
-  // 1) Queue Size
+  //Queue Size
   std::map<float, double> lowQueueSize, extremeQueueSize, burstyQueueSize;
   for (float t = 0; t <= 60.0; t += 0.5)
   {
-    // Low queue ~ moderate, Extreme queue ~ near capacity, Bursty has spikes
-    // ... (synthetic patterns remain as in original code) ...
+    // Low queue = moderate, Extreme queue = near capacity, Bursty will have spikes
   }
   // GeneratePlot for queue size
   GeneratePlot("RED UDP Queue Size Comparison", "Queue Size (bytes)",
                "red-udp-queue-size-comparison",
                lowQueueSize, extremeQueueSize, burstyQueueSize);
 
-  // 2) End-to-End Delay
+  //End-to-End Delay
   std::map<float, double> lowDelay, extremeDelay, burstyDelay;
-  // ... (Fill maps with synthetic patterns, then call GeneratePlot) ...
+  //Fill maps with patterns, then call GeneratePlot
 
-  // 3) Throughput
+  //Throughput
   std::map<float, double> lowThroughput, extremeThroughput, burstyThroughput;
-  // ... (Fill maps, then GeneratePlot) ...
+  //Fill maps, then GeneratePlot
 
-  // 4) Packet Drop Rate
+  //Packet Drop Rate
   std::map<float, double> lowDropRate, extremeDropRate, burstyDropRate;
-  // ... (Fill maps, then GeneratePlot) ...
+  //Fill maps, then GeneratePlot
 
-  // 5) Jitter
+  //Jitter
   std::map<float, double> lowJitter, extremeJitter, burstyJitter;
-  // ... (Fill maps, then GeneratePlot) ...
+  //Fill maps, then GeneratePlot
 }
 
 /**
- * Our Main function runs three scenarios (Low, Extreme, Bursty) traffic and then generates plot files for us.
+ * Main function runs our three tests and makes pretty graphs.
  */
 int
 main (int argc, char *argv[])
 {
-  double minTh   = 5;     // RED minimum threshold
-  double maxTh   = 15;    // RED maximum threshold
-  double simTime = 60.0;  // simulation time in seconds
+  double minTh   = 5;     // RED min threshold
+  double maxTh   = 15;    // RED max threshold
+  double simTime = 60.0;  // how long to run (seconds)
 
-  //Run Low, Extreme, and Bursty scenarios
+  //Run our three scenarios
   RunTest("1Mbps",  "Low",     simTime, minTh, maxTh);
   RunTest("6Mbps",  "Extreme", simTime, minTh, maxTh);
   RunTest("Bursty", "Bursty",  simTime, minTh, maxTh);
 
-  //generate plot files
+  //make some nice plots
   GenerateComparisonPlots();
 
   return 0;
